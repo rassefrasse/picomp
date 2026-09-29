@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# picomp - generate a self-contained Raspberry Pi Pico project (C + ARM assembly)
+# in the CURRENT directory.
+#
+# Usage:   picomp <project_name> [board]
+# Boards:  pico (default, also the Pico H), pico_w, pico2, pico2_w
+# Env:     PICO_SDK_PATH   path to pico-sdk (default: ~/pico/pico-sdk)
+
+set -euo pipefail
+
+NAME="${1:-}"
+BOARD="${2:-pico}"
+
+if [[ -z "$NAME" || "$NAME" == "-h" || "$NAME" == "--help" ]]; then
+    sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+fi
+
+if [[ ! "$NAME" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    echo "Error: project name may only contain letters, digits and underscores (and can't start with a digit)." >&2
+    exit 1
+fi
+
+case "$BOARD" in
+    pico|pico_w)   CPU="cortex-m0plus" ;;
+    pico2|pico2_w) CPU="cortex-m33" ;;
+    *) echo "Error: unknown board '$BOARD' (use pico, pico_w, pico2 or pico2_w)." >&2; exit 1 ;;
+esac
+
+SDK="${PICO_SDK_PATH:-$HOME/pico/pico-sdk}"
+if [[ ! -f "$SDK/external/pico_sdk_import.cmake" ]]; then
+    echo "Error: pico-sdk not found at '$SDK'." >&2
+    echo "Set it with: export PICO_SDK_PATH=/path/to/pico-sdk" >&2
+    exit 1
+fi
+
+DIR="$PWD/$NAME"
+if [[ -e "$DIR" ]]; then
+    echo "Error: $DIR already exists. Pick another name or delete it." >&2
+    exit 1
+fi
+
+mkdir "$DIR"
+cd "$DIR"
+
+# Copied in so the project doesn't depend on anything else in this folder tree
+cp "$SDK/external/pico_sdk_import.cmake" .
+
+# ---------- CMakeLists.txt ----------
+cat > CMakeLists.txt << 'EOF'
+cmake_minimum_required(VERSION 3.13)
+set(PICO_BOARD __BOARD__)
+include(pico_sdk_import.cmake)
+
+project(__NAME__ C CXX ASM)
+set(CMAKE_C_STANDARD 11)
+pico_sdk_init()
+
+add_executable(__NAME__
+    main.c
+    asm_funcs.S
+)
+
+target_link_libraries(__NAME__ pico_stdlib)
+
+# printf goes over USB serial (/dev/ttyACM0), not the UART pins
+pico_enable_stdio_usb(__NAME__ 1)
+pico_enable_stdio_uart(__NAME__ 0)
+
+# generates .uf2, .bin, .hex and a .dis disassembly
+pico_add_extra_outputs(__NAME__)
+EOF
+
+# ---------- main.c ----------
+cat > main.c << 'EOF'
+#include <stdio.h>
+#include "pico/stdlib.h"
+
+// Implemented in asm_funcs.S
+extern int add_asm(int a, int b);
+
+int main(void) {
+    stdio_init_all();
+
+#ifdef PICO_DEFAULT_LED_PIN
+    gpio_init(PICO_DEFAULT_LED_PIN);
+    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+#endif
+
+    int counter = 0;
+    while (true) {
+#ifdef PICO_DEFAULT_LED_PIN
+        gpio_put(PICO_DEFAULT_LED_PIN, counter & 1);
+#endif
+        printf("[%d] 2 + 3 = %d\n", counter++, add_asm(2, 3));
+        sleep_ms(500);
+    }
+}
+EOF
+
+# ---------- asm_funcs.S ----------
+cat > asm_funcs.S << 'EOF'
+.syntax unified
+.cpu __CPU__
+.thumb
+
+@ int add_asm(int a, int b)   a in r0, b in r1, result returned in r0
+.global add_asm
+.type add_asm, %function
+.thumb_func
+add_asm:
+    adds r0, r0, r1
+    bx   lr
+EOF
+
+# ---------- build.sh ----------
+cat > build.sh << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+export PICO_SDK_PATH="${PICO_SDK_PATH:-$HOME/pico/pico-sdk}"
+
+# CMake caches absolute paths, so a moved/copied project needs a fresh build dir
+if [[ -f build/CMakeCache.txt ]] && \
+   ! grep -qxF "CMAKE_HOME_DIRECTORY:INTERNAL=$PWD" build/CMakeCache.txt; then
+    echo "Project was moved - clearing old build directory..."
+    rm -rf build
+fi
+
+mkdir -p build
+cd build
+cmake ..
+make -j"$(nproc)"
+echo
+echo "Built: $(pwd)/__NAME__.uf2"
+EOF
+
+# ---------- flash.sh ----------
+cat > flash.sh << 'EOF'
+#!/usr/bin/env bash
+# Builds, then copies the .uf2 to the Pico. Put the Pico in BOOTSEL mode first
+# (hold BOOTSEL while plugging in), or install picotool to skip that step.
+set -euo pipefail
+cd "$(dirname "$0")"
+./build.sh
+
+UF2="build/__NAME__.uf2"
+
+if command -v picotool >/dev/null 2>&1 && picotool info >/dev/null 2>&1; then
+    picotool load -f -x "$UF2"
+    echo "Flashed with picotool."
+    exit 0
+fi
+
+for d in "/media/$USER/RPI-RP2" "/run/media/$USER/RPI-RP2" \
+         "/media/$USER/RP2350" "/run/media/$USER/RP2350"; do
+    if [[ -d "$d" ]]; then
+        cp "$UF2" "$d/"
+        sync
+        echo "Flashed to $d. The Pico will reboot into your program."
+        exit 0
+    fi
+done
+
+echo "No Pico found in BOOTSEL mode." >&2
+echo "Unplug it, hold BOOTSEL, plug it in, release, then run ./flash.sh again." >&2
+exit 1
+EOF
+
+# ---------- monitor.sh ----------
+cat > monitor.sh << 'EOF'
+#!/usr/bin/env bash
+# Opens the Pico's USB serial output. Exit minicom with Ctrl+A then X.
+exec minicom -b 115200 -D /dev/ttyACM0
+EOF
+
+printf 'build/\n' > .gitignore
+
+# ---------- fill in placeholders ----------
+sed -i -e "s/__NAME__/$NAME/g" -e "s/__BOARD__/$BOARD/g" -e "s/__CPU__/$CPU/g" \
+    CMakeLists.txt main.c asm_funcs.S build.sh flash.sh monitor.sh
+chmod +x build.sh flash.sh monitor.sh
+
+echo "Created $DIR  (board: $BOARD)"
+echo
+echo "Next:"
+echo "  cd $NAME"
+echo "  ./flash.sh      # build + flash (Pico in BOOTSEL mode)"
+echo "  ./monitor.sh    # watch the printf output"
